@@ -9,6 +9,29 @@ from timm.models.layers import trunc_normal_
 from model.blocks import CBlock_ln, SwinTransformerBlock
 from model.global_net import Global_pred
 
+class IlluminationGating(nn.Module):
+    def __init__(self, in_dim=3, hidden_dim=16, gate_scale=0.2):
+        super(IlluminationGating, self).__init__()
+        self.in_dim = in_dim
+        self.gate_scale = gate_scale
+        self.conv1 = nn.Conv2d(in_dim + 1, hidden_dim, kernel_size=3, stride=1, padding=1)
+        self.act = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        self.conv2 = nn.Conv2d(hidden_dim, 1, kernel_size=3, stride=1, padding=1)
+        # Identity-preserving init: gate starts from 1.0 to avoid hurting baseline at early stage.
+        nn.init.constant_(self.conv2.weight, 0.0)
+        nn.init.constant_(self.conv2.bias, 0.0)
+
+    def forward(self, img):
+        # Assume RGB luminance when available, otherwise use channel-wise mean.
+        if self.in_dim >= 3:
+            y = 0.299 * img[:, 0:1, :, :] + 0.587 * img[:, 1:2, :, :] + 0.114 * img[:, 2:3, :, :]
+        else:
+            y = img.mean(dim=1, keepdim=True)
+        gate_input = torch.cat([img, y], dim=1)
+        gate_logits = self.conv2(self.act(self.conv1(gate_input)))
+        gate_delta = 2.0 * torch.sigmoid(gate_logits) - 1.0
+        return 1.0 + self.gate_scale * gate_delta
+
 class Local_pred(nn.Module):
     def __init__(self, dim=16, number=4, type='ccc'):
         super(Local_pred, self).__init__()
@@ -91,11 +114,14 @@ class Local_pred_S(nn.Module):
         return mul, add
 
 class IAT(nn.Module):
-    def __init__(self, in_dim=3, with_global=True, type='lol'):
+    def __init__(self, in_dim=3, with_global=True, type='lol', use_gate=True):
         super(IAT, self).__init__()
         #self.local_net = Local_pred()
         
         self.local_net = Local_pred_S(in_dim=in_dim)
+        self.use_gate = use_gate
+        if self.use_gate:
+            self.gate_net = IlluminationGating(in_dim=in_dim)
 
         self.with_global = with_global
         if self.with_global:
@@ -111,6 +137,10 @@ class IAT(nn.Module):
     def forward(self, img_low):
         #print(self.with_global)
         mul, add = self.local_net(img_low)
+        if self.use_gate:
+            gate = self.gate_net(img_low)
+            mul = 1.0 + gate * (mul - 1.0)
+            add = gate * add
         img_high = (img_low.mul(mul)).add(add)
 
         if not self.with_global:

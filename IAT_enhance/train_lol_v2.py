@@ -27,6 +27,7 @@ parser.add_argument('--img_path', type=str, default="/data/unagi0/cui_data/light
 parser.add_argument('--img_val_path', type=str, default="/data/unagi0/cui_data/light_dataset/LOL/Test/Low/")
 parser.add_argument("--normalize", action="store_false", help="Default Normalize in LOL training.")
 parser.add_argument('--model_type', type=str, default='s')
+parser.add_argument('--no_gate', action='store_true', help='Disable illumination gate for ablation.')
 
 parser.add_argument('--batch_size', type=int, default=8)
 parser.add_argument('--lr', type=float, default=2e-4)
@@ -36,6 +37,11 @@ parser.add_argument('--pretrain_dir', type=str, default=None)
 parser.add_argument('--num_epochs', type=int, default=200)
 parser.add_argument('--display_iter', type=int, default=10)
 parser.add_argument('--snapshots_folder', type=str, default="workdirs/snapshots_folder_lol")
+parser.add_argument('--w_perceptual', type=float, default=0.04)
+parser.add_argument('--w_rank', type=float, default=0.01)
+parser.add_argument('--w_dark_tv', type=float, default=0.002)
+parser.add_argument('--rank_margin', type=float, default=0.02)
+parser.add_argument('--aux_start_epoch', type=int, default=20)
 
 config = parser.parse_args()
 
@@ -46,7 +52,7 @@ if not os.path.exists(config.snapshots_folder):
     os.makedirs(config.snapshots_folder)
 
 # Model Setting
-model = IAT(type=config.model_type).cuda()
+model = IAT(type=config.model_type, use_gate=not config.no_gate).cuda()
 if config.pretrain_dir is not None:
     model.load_state_dict(torch.load(config.pretrain_dir))
 
@@ -77,6 +83,26 @@ print('the device is:', device)
 L1_loss = nn.L1Loss()
 L1_smooth_loss = F.smooth_l1_loss
 
+def rgb_to_luminance(img):
+    if img.shape[1] >= 3:
+        return 0.299 * img[:, 0:1, :, :] + 0.587 * img[:, 1:2, :, :] + 0.114 * img[:, 2:3, :, :]
+    return img.mean(dim=1, keepdim=True)
+
+def luminance_rank_loss(enhance_img, high_img, margin=0.02):
+    y_pred = rgb_to_luminance(enhance_img)
+    y_gt = rgb_to_luminance(high_img)
+    pred_diff = y_pred[:, :, :, :-1] - y_pred[:, :, :, 1:]
+    gt_diff = y_gt[:, :, :, :-1] - y_gt[:, :, :, 1:]
+    return F.relu(margin - pred_diff * gt_diff).mean()
+
+def dark_region_tv_loss(enhance_img, low_img):
+    dark_weight = (1.0 - rgb_to_luminance(low_img)).clamp(0.0, 1.0)
+    grad_h = torch.abs(enhance_img[:, :, 1:, :] - enhance_img[:, :, :-1, :])
+    grad_w = torch.abs(enhance_img[:, :, :, 1:] - enhance_img[:, :, :, :-1])
+    weight_h = dark_weight[:, :, 1:, :]
+    weight_w = dark_weight[:, :, :, 1:]
+    return (grad_h * weight_h).mean() + (grad_w * weight_w).mean()
+
 loss_network = LossNetwork(vgg_model)
 loss_network.eval()
 
@@ -99,7 +125,14 @@ for epoch in range(config.num_epochs):
         model.train()
         mul, add, enhance_img = model(low_img)
 
-        loss = L1_smooth_loss(enhance_img, high_img)+0.04*loss_network(enhance_img, high_img)
+        rec_loss = L1_smooth_loss(enhance_img, high_img)
+        perceptual_loss = loss_network(enhance_img, high_img)
+        rank_loss = luminance_rank_loss(enhance_img, high_img, margin=config.rank_margin)
+        dark_tv = dark_region_tv_loss(enhance_img, low_img)
+        aux_scale = 1.0 if epoch >= config.aux_start_epoch else 0.0
+        loss = rec_loss + config.w_perceptual * perceptual_loss + aux_scale * (
+            config.w_rank * rank_loss + config.w_dark_tv * dark_tv
+        )
         
         loss.backward()
         
@@ -107,7 +140,15 @@ for epoch in range(config.num_epochs):
         scheduler.step()
 
         if ((iteration + 1) % config.display_iter) == 0:
-            print("Loss at iteration", iteration + 1, ":", loss.item())
+            print(
+                "Loss at iteration", iteration + 1, ":",
+                "total=", round(loss.item(), 6),
+                "rec=", round(rec_loss.item(), 6),
+                "perc=", round(perceptual_loss.item(), 6),
+                "rank=", round(rank_loss.item(), 6),
+                "dark_tv=", round(dark_tv.item(), 6),
+                "aux_scale=", aux_scale
+            )
 
     # Evaluation Model
     model.eval()
