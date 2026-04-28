@@ -27,6 +27,7 @@ parser.add_argument('--img_path', type=str, default="/data/unagi0/cui_data/light
 parser.add_argument('--img_val_path', type=str, default="/data/unagi0/cui_data/light_dataset/LOL/Test/Low/")
 parser.add_argument("--normalize", action="store_false", help="Default Normalize in LOL training.")
 parser.add_argument('--model_type', type=str, default='s')
+parser.add_argument('--no_gate', action='store_true', help='Disable illumination gate for ablation.')
 
 parser.add_argument('--batch_size', type=int, default=8)
 parser.add_argument('--lr', type=float, default=2e-4)
@@ -37,9 +38,10 @@ parser.add_argument('--num_epochs', type=int, default=200)
 parser.add_argument('--display_iter', type=int, default=10)
 parser.add_argument('--snapshots_folder', type=str, default="workdirs/snapshots_folder_lol")
 parser.add_argument('--w_perceptual', type=float, default=0.04)
-parser.add_argument('--w_rank', type=float, default=0.05)
-parser.add_argument('--w_dark_tv', type=float, default=0.01)
+parser.add_argument('--w_rank', type=float, default=0.01)
+parser.add_argument('--w_dark_tv', type=float, default=0.002)
 parser.add_argument('--rank_margin', type=float, default=0.02)
+parser.add_argument('--aux_start_epoch', type=int, default=20)
 
 config = parser.parse_args()
 
@@ -50,7 +52,7 @@ if not os.path.exists(config.snapshots_folder):
     os.makedirs(config.snapshots_folder)
 
 # Model Setting
-model = IAT(type=config.model_type).cuda()
+model = IAT(type=config.model_type, use_gate=not config.no_gate).cuda()
 if config.pretrain_dir is not None:
     model.load_state_dict(torch.load(config.pretrain_dir))
 
@@ -127,7 +129,10 @@ for epoch in range(config.num_epochs):
         perceptual_loss = loss_network(enhance_img, high_img)
         rank_loss = luminance_rank_loss(enhance_img, high_img, margin=config.rank_margin)
         dark_tv = dark_region_tv_loss(enhance_img, low_img)
-        loss = rec_loss + config.w_perceptual * perceptual_loss + config.w_rank * rank_loss + config.w_dark_tv * dark_tv
+        aux_scale = 1.0 if epoch >= config.aux_start_epoch else 0.0
+        loss = rec_loss + config.w_perceptual * perceptual_loss + aux_scale * (
+            config.w_rank * rank_loss + config.w_dark_tv * dark_tv
+        )
         
         loss.backward()
         
@@ -141,7 +146,8 @@ for epoch in range(config.num_epochs):
                 "rec=", round(rec_loss.item(), 6),
                 "perc=", round(perceptual_loss.item(), 6),
                 "rank=", round(rank_loss.item(), 6),
-                "dark_tv=", round(dark_tv.item(), 6)
+                "dark_tv=", round(dark_tv.item(), 6),
+                "aux_scale=", aux_scale
             )
 
     # Evaluation Model

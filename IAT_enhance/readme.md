@@ -80,9 +80,14 @@ python train_lol_v2.py \
   --img_val_path Your_Path/Test/Low/ \
   --num_epochs 20 \
   --w_perceptual 0.04 \
-  --w_rank 0.05 \
-  --w_dark_tv 0.01 \
-  --rank_margin 0.02
+  --w_rank 0.01 \
+  --w_dark_tv 0.002 \
+  --rank_margin 0.02 \
+  --aux_start_epoch 20
+```
+For baseline ablation without gate:
+```
+python train_lol_v2.py --gpu_id 0 --img_path Your_Path/Train/Low --img_val_path Your_Path/Test/Low/ --num_epochs 20 --no_gate
 ```
 
 <br/>
